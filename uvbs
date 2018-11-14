@@ -1,0 +1,392 @@
+#!/bin/bash
+# This file: /root/bin/uvbs (on the production server)
+# eclipse backups done with snapshots
+# Mel - 2015-10-13 - started first version
+# Mel - 2015-10-27 - add nosecurity and clean additional nosecurity variables
+# Mel - 2015-11-24 - added support for pause file created by refresh processes on other servers
+# Mel - 2015-12-16 - moved functions higher - pause check was calling function before it existed
+# Mel - 2015-12-28 - try to add a useful error message when out of space in volumn group
+# Mel - 2016-02-04 - minor syntax changes that actually execute slightly faster
+# Mel - 2016-02-20 - add date/time to uvbs.status so backup rsync will see a different file and initiate a backup
+# Mel - 2016-08-03 - sync uvbs.status to target server, so it can do the compression, diaper-v can't handle it
+# Mel - 2017-07-24 - change order of syncing the snapshots to hopefully avoid overflow of the smaller ones
+# Mel - 2017-11-30 - remove old uvlock status files from /tmp
+# Mel - 2018-04-02 - sync before snap to reduce database locked time
+
+# we need to be root to do snapshots
+if [[ "$(whoami)" != "root" ]];then
+    echo "Not root - exiting"
+    exit 1
+fi
+
+# All variables are in the file below
+configs=/etc/uvbacksnap.conf
+
+for requiredfile in $configs /.uvhome;do
+    if [[ ! -f $requiredfile ]];then
+        echo "Missing required file: $requiredfile"
+        filesok="no"
+    fi
+done
+[[ "$filesok" == "no" ]] && exit 1
+
+# check for required software
+requiredsoftware="mutt:mutt rsync:rsync sync:corutils bc:bc"
+[[ "$logfile" == "SYSLOG" ]] && requiredsoftware="$requiredsoftware logger:util-linux"
+for x in $requiredsoftware;do
+    if [[ "$(which ${x%%:*} 2>/dev/null)" == "" ]];then
+        stillneeded="$stillneeded ${x##*:}"
+        echo "Missing software: ${x%%:*}"
+    fi
+done
+if [[ ! -z $stillneeded ]];then
+    echo "Install missing software with:"
+    echo "yum -y install $stillneeded"
+    exit 1
+fi
+
+if [[ -r $configs ]];then
+    . $configs
+    if [[ $? -ne 0 ]];then
+        echo "errors while sourcing $configs - exiting"
+        exit 1
+    fi
+else
+    echo "$configs is not readable"
+    exit 1
+fi
+
+uvbin="$(cat /.uvhome)/bin"
+if [[ "$uvbin" == "" ]] || [[ ! -d "$uvbin" ]];then
+    echo "Missing bin for uv: $uvbin"
+    exit 1
+fi
+
+############ functions #########################
+uvbstatus(){
+    echo "$1" >$uvbsstatusfile
+    logentry "Updating $uvbsstatusfile on $targethost with status: \"$1\""
+    rsync -aq --timeout=120 $uvbsstatusfile $targethost:$nosec/etc/
+    [[ $? -ne 0 ]] && errormsgout "Error while updating $uvbsstatusfile on $targethost with status: \"$(cat $uvbsstatusfile)\""
+}
+
+logentry(){
+    if [[ "$logfile" != "SYSLOG" ]];then
+        if [[ ! -d $(dirname $logfile) ]];then
+            mkdir -p $(dirname $logfile) >/tmp/error.out.$$ 2>&1
+            [[ $? -eq 0 ]] || errormsgout "Could not create directory for logfile: $(dirname $logfile)" /tmp/error.out.$$ 
+        fi
+        echo "$(date '+%b %e %T') $(hostname) $(basename $0)[$$] $1" >>$logfile
+    else
+        logger $loggerargs "$1"
+    fi
+}
+
+logentryfile(){
+    logentry "$1"
+    if [[ "$logfile" != "SYSLOG" ]];then
+        awk -vhdr="$(date '+%b %e %T') $(hostname) $(basename $0)[$$]" '{printf("%s %s\n",hdr,$0)}' $2 >>$logfile
+    else
+        logger $loggerargs -f $2
+    fi
+}
+
+cleanexit(){
+    uvbstatus "Completed: $(date +%F-%T)"
+    if [[ ! -z "$okmail" ]];then
+        echo "Backup of $(hostname) completed normally: $(date)"|mutt -s "Backup of $(hostname) completed" $okmail
+    fi
+    [[ "$1" == "" ]] && logentry "$(basename $0) finished." || logentry "$1"
+    [[ -f $lockfile ]] && /bin/rm -f $lockfile
+    exit 0
+}
+
+errorexit(){
+    # prevent race condition with $1
+    [[ ! -z "$1" ]] && race=$1 || race=1
+    logentry "Error exit: cleaning up"
+    if [[ "$uvstatus" == "active" ]] && [ "$race" -lt 2 ];then
+        logentry "Error exit: database locked. Attempting unlock"
+        uvunlock $((race+1))
+    fi
+    [[ -f $lockfile ]] && /bin/rm -f $lockfile
+    logentry "Error exit: race was: $race -- bye"
+    [[ "$uvstatus" == "active" ]] && errormsg="WARNING: database is still locked! -- $errormsg"
+    [[ "$errorfile" == "" ]] || muttargs="-a $errorfile --"
+    uvbstatus "Failed: $(date +%F-%T) - $errormsg"
+    exit $race
+}
+
+errormsgout(){
+    [[ "$errormsg" == "" ]] && errormsg="$1"
+    [[ "$errorfile" == "" ]] && errorfile=$2 
+    logentryfile "$1" $2
+    errorexit $((race+1))
+}
+    
+# populates global var: uvstatus with current "lock" state
+# normally called with no arguments except from errorexit function for race condition prevention
+uvlockstatus(){
+    race=$1
+    if [[ ! -f $uvbin/uv ]];then
+        logentry "Missing uv binary: $uvbin/uv"
+        errorexit $((race+1))
+    fi
+    if [[ ! -x $uvbin/uv ]];then
+        logentry "You do not have permission to run $uvbin/uv"
+        errorexit $((race+1))
+    fi
+    ckstatus="$($uvbin/uv -admin -R 2>&1)"
+    retcode=$?
+    uvstatus="${ckstatus##* }"
+    case "$uvstatus" in
+        active) return ;;
+        inactive) return ;;
+        *)
+            logentry "Unknown lock status: $ckstatus"
+            errorexit $((race+1))
+            ;;
+    esac
+}
+
+# lock uv database
+# normally called with no arguments except from errorexit function for race condition prevention
+uvlock(){
+    race=$1
+    uvlockstatus
+    if [[ "$uvstatus" == "active" ]];then
+        logentry "Warning: uv status was already locked"
+    elif [[ "$uvstatus" == "inactive" ]];then
+        # sync before locking database to reduce locking time
+        for x in 1 2;do
+            sync >/tmp/sync.out.$$ 2>&1
+            if [[ $? -ne 0 ]];then
+                errormsgout "Error: sync #$x before lock failed (error output below)" /tmp/sync.out.$$
+            fi
+        done
+        logentry "locking uv database"
+        $uvbin/uv -admin -L >/tmp/uvlock.out.$$ 2>&1
+        if [[ $? -ne 0 ]];then
+            errormsgout "Error: uv database lock failed (error output below)" /tmp/uvlock.out.$$
+        else
+            /bin/rm -f /tmp/uvlock.out.$$
+            logentry "uv database is locked"
+        fi
+        # sync schedules the flush to disk but returns before the actual flush completes.
+        # subsequent sync command will block until any outstanding flush in progress finishes,
+        # before scheduling another flush and exiting. Therefore, with the database locked
+        # 2 syncs are necessary to ensure synchronous flush.
+        logentry "syncing disk writes..."
+        for x in 1 2;do
+            sync >/tmp/sync.out.$$ 2>&1
+            if [[ $? -ne 0 ]];then
+                errormsgout "Error: sync #$x after lock failed (error output below)" /tmp/sync.out.$$
+            fi
+        done
+        logentry "disk write sync complete"
+    # no else is needed, because I trap other possibles in uvlockstatus
+    fi
+    # update uvstatus before returning
+    uvlockstatus
+}
+
+# unlock uv database
+# normally called with no arguments except from errorexit function for race condition prevention
+uvunlock(){
+    race=$1
+    uvlockstatus
+    logentry "unlocking uv database"
+    if [[ "$uvstatus" == "inactive" ]];then
+        logentry "Warning: uv status was already unlocked. Backup may be bad."
+        errorexit $((race+1))
+    elif [[ "$uvstatus" == "active" ]];then
+        $uvbin/uv -admin -U >/tmp/uvunlock.out.$$ 2>&1
+        if [[ $? -ne 0 ]];then
+            errormsgout "Error: uv database unlock failed (error output below)" /tmp/uvunlock.out.$$
+        else
+            logentry "uv database is unlocked"
+        fi
+    fi
+    # update uvstatus before returning
+    uvlockstatus
+}
+
+makedirectory(){
+    if [[ ! -d $1 ]];then
+        mkdir -p $1 >/tmp/error.out.$$ 2>&1
+        [[ $? -ne 0 ]] && errormsgout "$2" /tmp/error.out.$$
+    fi
+}
+
+# pause file may be created by refresh processes on test servers
+if [[ -f /etc/uvbs.paused ]];then
+    logentryfile "Pause file exists and contains:" /etc/uvbs.paused
+    exit 1
+fi
+
+######## negotiate lockfile - all exits should now remove the lockfile #######
+if [[ -s $lockfile ]];then
+    logentry "Tried to run, but lock file already exists"
+    cat << MEL | mutt -s "Error: $(basename $0) already running" $errormail
+$(basename $0) tried to run, but lock file already exists
+---
+$(ps w -p $(cat $lockfile))
+MEL
+    exit 1
+else
+    echo "$$" >$lockfile
+    sleep 2
+    if [[ "$$" != "$(cat $lockfile)" ]];then
+        cat << MEL |mutt -s "Error: $(basename $0) stepped on" $errormail
+Tried to run $(basename $0), but another process stepped on me.
+Contents of $lockfile is: $(cat $lockfile)
+MEL
+        exit 1
+    fi
+fi
+trap "{ [[ -f $lockfile ]] && /bin/rm -f $lockfile;exit 1; }" INT HUP QUIT ALRM TERM
+
+echo "$(date +%F-%T) In progress: Checking configs" >$uvbsstatusfile
+
+######################## main section starts here #########################
+
+if [[ "$security" == "off" ]];then
+   nosec=":"
+   # this makes directories trailing / optional, but it is needed in the
+   # rsync command below. Note: not needed for snapmodule
+   alsomodule="${alsomodule%%/}/"
+   copiesmodule="${copiesmodule%%/}/"
+   logentry "Warning: security=off (tard at the helm)"
+else
+   unset nosec snapmodule alsomodule copiesmodule
+fi
+
+# verify directories to snapshot actually exist
+for onedir in $dirstosnap;do
+    [[ ! -d $onedir ]] && errordirs="$errordirs $onedir"
+done
+
+# direct to null, I can't think of a way to screw up that I won't catch above
+#filesystems="$(df $dirstosnap 2>/dev/null|grep '^/'|awk '{print $1}'|tac)"
+# sort in size order to make sure we do the largest ones last. small ones will overflow snapshot while the larger ones are syncing
+filesystems="$(df -mP $dirstosnap|grep -v Used|awk '{printf("%07d %s\n",$2,$1)}'|sort|awk '{print $2}'|grep '^/')"
+[[ $? -eq 0 ]] || errordirs="$errordirs (df had errors with: $dirstosnap)"
+
+if [[ ! -z "$errordirs" ]];then
+    # send both to screen and email
+    cat << MEL | tee /tmp/error.msg.$$
+Found invalid directories: $errordirs
+Please check dirstosnap in $configs
+MEL
+    cat /tmp/error.msg.$$ |mutt -s "Error: $(basename $0) configuration" $errormail
+    errorexit
+fi
+
+# in case someone tried to lvm snapshot an non-lvm partition
+cat /dev/null >/tmp/error.msg.$$
+for x in $filesystems;do
+    lvs --noheadings $filesystems >/tmp/lvs.out.$$ 2>&1
+    [[ $? -ne 0 ]] && cat /tmp/lvs.out.$$ >>/tmp/error.msg.$$
+done
+if [[ -s /tmp/error.msg.$$ ]];then
+    echo "Error: dirstosnap in $configs"
+    cat /tmp/error.msg.$$
+    echo -e "Error: dirstosnap in $configs\r\n$(cat /tmp/error.msg.$$)" |mutt -s "Error: $(basename $0) dirstosnap in $configs"
+    errorexit
+fi
+
+# check for errors in the given directries to snapshot
+volumngroups="$(lvs --noheadings $filesystems|awk '{print $2}'|sort -u)"
+if [[ $? -ne 0 ]];then
+    cat << MEL | tee /tmp/error.msg.$$
+Error occured while checking lvms:
+$filesystems
+MEL
+    cat /tmp/error.msg.$$ |mutt -s "Error: $(basename $0) check lvms" $errormail
+    errorexit
+fi
+
+# check if we have enough space to do snapshots
+for thisvg in $volumngroups;do
+    vgline="$(vgs --noheadings --unit k $thisvg)"
+    vgparts=($vgline)
+    vgfreepercent="$(echo "scale=2;${vgparts[6]%%.*}/${vgparts[5]%%.*}"|bc)"
+    vgfreepercent="${vgfreepercent##*.}"
+    if [[ $((10#${vgfreepercent})) -ge $((10#${minpercent})) ]];then	# this converts the values from base 10 to base 10 which strips any leading zeros
+        logentry "Volumn group: $thisvg is ok. It has room for snapshots $vgfreepercent% free space"
+    else
+        errormsg="Error: Volumn group: $thisvg has only $vgfreepercent% free space (not enough room)"
+        logentry "Error: Volumn group: $thisvg has only $vgfreepercent% free space"
+        logentry "Error: Volumn group: $thisvg does not have enough space for snapshots"
+        errorexit
+    fi
+done
+
+# parse all info that we need for snapshots
+for onedirectory in $filesystems;do
+    lvsline="$(lvs --noheadings $onedirectory)"
+    lvsparts=($lvsline)
+    dfpath="$(df $onedirectory|tail -1|awk '{print $NF}')"
+    # vg / lv / dir
+    parseddirs="$parseddirs ${lvsparts[1]}/${lvsparts[0]}/${dfpath##*/}"
+done
+
+#echo "filesystems=$filesystems"
+#echo "parseddirs=$parseddirs"
+
+uvbstatus "In progress: $(date +%F-%T) - Creating snapshots"
+
+# do the snapshots
+makedirectory $uvbsmount "Could not create uvbsmount from $configs: $uvbsmount"
+uvlock
+for onedirectory in $parseddirs;do
+    oIFS=$IFS
+    IFS=/
+    dirparts=($onedirectory)
+    IFS=$oIFS
+    #echo "lvcreate -s -l $allocpercent%ORIGIN -n ${dirparts[2]}-uvbs$$ ${dirparts[0]}/${dirparts[1]}"
+    lvcreate -s -l $allocpercent%ORIGIN -n ${dirparts[2]}-uvbs$$ ${dirparts[0]}/${dirparts[1]} >/tmp/error.out.$$ 2>&1
+    [[ $? -ne 0 ]] && errormsgout "Could not create snapsnot of ${dirparts[2]}" /tmp/error.out.$$
+    makedirectory $uvbsmount/${dirparts[2]}-uvbs$$ "Could not create directory $uvbsmount/${dirparts[2]}-uvbs$$"
+    mount /dev/${dirparts[0]}/${dirparts[2]}-uvbs$$ $uvbsmount/${dirparts[2]}-uvbs$$
+done
+uvunlock
+
+uvbstatus "In progress: $(date +%F-%T) - Rsyncing snapshots"
+
+# snapshots are done, now sync them to targethost
+pushd $uvbsmount >/dev/null
+for onedirectory in $parseddirs;do
+    oIFS=$IFS
+    IFS=/
+    dirparts=($onedirectory)
+    IFS=$oIFS
+    logentry "syncing snapshot: ${dirparts[2]} to $targethost:$nosec$snapmodule/${dirparts[2]}"
+    rsync -aq --delete --timeout=120 ${dirparts[2]}-uvbs$$/ $targethost:$nosec$snapmodule/${dirparts[2]} >/tmp/error.out.$$ 2>&1
+    [[ $? -ne 0 ]] && errormsgout "Error rsyncing to $targethost:$nosec$snapmodule/${dirparts[2]} (snapshots still mounted)" /tmp/error.out.$$
+    umount $uvbsmount/${dirparts[2]}-uvbs$$ >/tmp/error.out.$$ 2>&1
+    [[ $? -ne 0 ]] && errormsgout "Error while unmounting $uvbsmount/${dirparts[2]}-uvbs$$ (snapshots still mounted)" /tmp/error.out.$$
+    lvremove -f ${dirparts[0]}/${dirparts[2]}-uvbs$$ >/tmp/error.out.$$ 2>&1
+    [[ $? -ne 0 ]] && errormsgout "Error while removing snapshot: ${dirparts[0]}/${dirparts[2]}-uvbs$$" /tmp/error.out.$$
+    /bin/rmdir ${dirparts[2]}-uvbs$$
+    [[ $? -ne 0 ]] && logentry "Non-fatal Error: unable to remove directory: ${dirparts[2]}-uvbs$$"
+done
+popd >/dev/null
+
+uvbstatus "In progress: $(date +%F-%T) - Rsyncing alsosyncdirs"
+
+for onedirectory in $alsosyncdirs;do
+    logentry "syncing alsosyncdir: $onedirectory to $targethost:$nosec$alsomodule$onedirectory"
+    rsync -aq --delete --timeout=120 $onedirectory/ $targethost:$nosec$alsomodule$onedirectory >/tmp/error.out.$$ 2>&1
+    [[ $? -ne 0 ]] && errormsgout "Error rsyncing $onedirectory to $targethost:$nosec$alsomodule/$onedirectory" /tmp/error.out.$$
+done
+
+uvbstatus "In progress: $(date +%F-%T) - Rsyncing synccopiesof"
+
+for onedirectory in $synccopiesof;do
+    logentry "syncing synccopiesof: $onedirectory to $targethost:$nosec$copiesmodule$placecopieshere"
+    rsync -aq --delete --timeout=120 $onedirectory $targethost:$nosec$copiesmodule$placecopieshere >/tmp/error.out.$$ 2>&1
+    [[ $? -ne 0 ]] && errormsgout "Error rsyncing $onedirectory to $targethost:$nosec$copiesmodule$placecopieshere" /tmp/error.out.$$
+done
+
+cleanexit

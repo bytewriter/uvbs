@@ -1,0 +1,117 @@
+#!/bin/bash
+# Mel - 2016-08-04 - create backup tar balls because the hyper-v vm can't get this done as fast as we are creating them.
+#                    this just watches the uvbs status file and creates a tar ball when it sees that it is done, then
+#                    it copies the tar ball to backup-lol-1 which is now toothless running in htper-v
+# Mel - 2016-08-07 - show process of already running if found
+
+conffile=/root/old/etc/uvbacksnap.conf
+lastsumfile=/root/.uvbs.sum
+tarlockfile=/var/run/$(basename $0).pid
+errmail="linux@example.com"
+tarfileshere=/root
+loglevel=3
+
+# we need to be root
+if [[ "$(whoami)" != "root" ]];then
+    echo "Not root - exiting"
+    exit 1
+fi
+
+if [[ ! -f $conffile ]];then
+    echo "missing file from prod that should have been rsynced here: $conffile"|mutt -s "Error running $(basename $0) on $(hostname)" $errmail
+    exit 1
+fi
+
+. $conffile
+. /root/bin/functions
+
+badexit(){
+    [[ -f $tarlockfile ]] && /bin/rm -f $tarlockfile
+    [[ -z $1 ]] && exit 1 || exit $1
+}
+
+cleanexit(){
+    [[ -f $tarlockfile ]] && /bin/rm -f $tarlockfile
+    exit 0
+}
+
+# are we already running ?
+if [[ -f $tarlockfile ]];then
+    if ! ps -p $(cat $tarlockfile) >/dev/null;then
+        # oops?!
+        logentry 5 "lock file exists but pid doesn't ($(cat $tarlockfile))"
+        # hmmm... how often will this happen? rebooted? crashed? I should probably just overwrite and continue
+        exit 1
+    else
+        logentry 3 "another process is already running this"
+        ps uwp $(cat $tarlockfile) >/tmp/ps.out.$$
+        logentryfile 2 /tmp/ps.out.$$
+        exit 0
+    fi
+else
+    echo "$$" >$tarlockfile
+    sleep 3
+    if [[ $(cat $tarlockfile) != $$ ]];then
+        logentry 5 "tried to run, but another process over-wrote my lockfile"
+        ps uwp $(cat $tarlockfile) >/tmp/ps.out.$$
+        logentryfile 5 /tmp/ps.out.$$
+        exit 1
+    fi
+fi
+
+trap "/bin/rm -f $tarlockfile;exit 1" INT HUP QUIT ALRM TERM
+
+if [[ ! -f $lastsumfile ]];then
+    # create the file if it doesn't exist and exit
+    sha1sum $uvbsstatusfile >$lastsumfile
+    logentry 3 "missing sum file created (first run?)"
+    cleanexit
+else
+    # has status file changed?
+    nowsum="$(sha1sum $uvbsstatusfile)"
+    nowsum="${nowsum%% *}"
+    thensum="$(cat $lastsumfile)"
+    thensum="${thensum%% *}"
+    # if no change, check again next run
+    logentry 2 "nowsum=$nowsum thensum=$thensum"
+    [[ $nowsum == $thensum ]] && cleanexit
+    if ! grep '^Completed:' $uvbsstatusfile >/dev/null;then
+        logentry 3 "sync still in progress"
+        # status has changed, but sync is not yet complete. Try again next run
+        cleanexit
+    fi
+fi
+
+# believe it or not, but the 4 lines below are actually faster than tarfilename="$(cat $uvbsstatusfile|sed 's/^[^:]*:\([^:]*\):.*$/\1/;s/ /-/g')"
+tarfilename="$(cat $uvbsstatusfile)"
+tarfilename="${tarfilename#*:}"
+tarfilename="${tarfilename%%:*}"
+tarfilename="${tarfilename// /-}"
+tarfilename="$(hostname -s)$tarfilename.bz2"
+logentry 2 "tarfilename = $tarfilename"
+cd $placecopieshere
+logentry 3 "starting tar to $tarfileshere/$tarfilename"
+tar c --use-compress-prog=pbzip2 -f $tarfileshere/$tarfilename * /usr/spool/uv /u2 /usr/local/bin /usr/local/sbin >/tmp/backup.tar.out.$$ 2>&1
+if [[ $? -ne 0 ]];then
+    cat << MEL |mutt -s "Error running $(basename $0) on $(hostname)" $errormail
+Error while creating tar was:
+$(cat /tmp/backup.tar.out.$$ 2>&1)
+MEL
+    logentryandfile 5 "error while creating tar was:" /tmp/backup.tar.out.$$
+    badexit
+fi
+logentry 3 "tar successfully created as $tarfileshere/$tarfilename"
+logentry 2 "copying $tarfileshere/$tarfilename to $backupserver:$backupserverdir/"
+scp -q $tarfileshere/$tarfilename $backupserver:$backupserverdir/ >/tmp/backup.scp.out.$$
+if [[ $? -ne 0 ]];then
+    cat << MEL |mutt -s "Error running $(basename $0) on $(hostname)" $errormail
+Error while copying $tarfileshere/$tarfilename to $backupserver:$backupserverdir/ was:
+$(cat /tmp/backup.scp.out.$$)
+MEL
+    logentryandfile 5 "Error while copying $tarfilename to $backupserver:$backupserverdir/ was:" /tmp/backup.scp.out.$$
+    badexit
+fi
+/bin/rm -f $tarfileshere/$tarfilename
+logentry 3 "backup successfully copied $tarfilename to $backupserver"
+sha1sum $uvbsstatusfile >$lastsumfile
+cleanexit
