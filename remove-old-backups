@@ -1,0 +1,60 @@
+#!/bin/bash
+# This file: /etc/cron.hourly/remove-old-backups (on the backup storage server)
+# remove old prod backups that were sent from prod fail-over server keeping
+# some in rotation
+# Mel - 2016-08-10 - first version
+# Mel - 2018-05-29 - add weekly rotation
+# Mel - 2018-10-29 - add monthly rotation
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/root/bin
+proddir=/backup/eclipse-prod
+prodcopies=30
+# how many weeklies to keep
+weekRotation=26
+# how many monthlies to keep
+monthRotation=12
+cd $proddir
+rotatebackups(){
+    let rotcount=$weekRotation+1
+    if [[ -f eclipse-prod.bz2.weekly.0 ]];then
+        let rotcount=$weekRotation+1
+        for rotnum in $(seq $rotcount -1 1);do
+            let oldrot=$rotnum-1
+            [[ -f eclipse-prod.bz2.weekly.$oldrot ]] && /bin/mv -f eclipse-prod.bz2.weekly.$oldrot eclipse-prod.bz2.weekly.$rotnum
+        done
+        if [[ -f eclipse-prod.bz2.weekly.$rotcount ]];then
+            # we added 1, so the extra rotation file (if created above) should be deleted or moved into monthly
+            newyrmo="$(date -r eclipse-prod.bz2.weekly.$rotcount +%Y%m)"
+            oldmonthly="$(ls -t eclipse-prod.bz2.monthly.*|tail -1)"
+            oldyrmo="$(date -r $oldmonthly +%Y%m)"
+            [[ $newyrmo == $oldyrmo ]] && /bin/rm -f eclipse-prod.bz2.weekly.$rotcount || /bin/mv -f eclipse-prod.bz2.weekly.$rotcount eclipse-prod.bz2.monthly.0
+        fi
+    fi
+    if [[ -f eclipse-prod.bz2.monthly.0 ]];then
+        let rotcount=$monthRotation+1
+        for rotnum in $(seq $rotcount -1 1);do
+            let oldrot=$rotnum-1
+            [[ -f eclipse-prod.bz2.monthly.$oldrot ]] && /bin/mv -f eclipse-prod.bz2.monthly.$oldrot eclipse-prod.bz2.monthly.$rotnum
+        done
+        # delete oldest monthly 
+        [[ -f eclipse-prod.bz2.monthly.$rotcount ]] && /bin/rm -f eclipse-prod.bz2.monthly.$rotcount
+    fi
+}
+while [[ $(ls *.bz2|wc -l) -gt $prodcopies ]];do
+    oldfile="$(ls -t *.bz2|tail -1)"
+    # keep a weekly backup from monday morning (monday=1)
+    if [[ $(date +%u -r $oldfile) -eq 1 ]];then
+        [[ -f eclipse-prod.bz2.weekly.1 ]] && lastrot="$(date +%D -r eclipse-prod.bz2.weekly.1)" || lastrot=""
+        # if there is a rotation file #1, does it have the same day as this file, if so we already have this week
+        if [[ "$lastrot" != "$(date +%D -r $oldfile)" ]];then
+            echo "$(date '+%b %e %T') $(hostname -s) $(basename $0)[$$] saving $oldfile as the weekly backup" >>/var/log/backups
+            rotatebackups
+            /bin/mv -f $oldfile eclipse-prod.bz2.weekly.0
+            rotatebackups
+            [[ -f eclipse-prod.bz2.weekly.0 ]] && rotatebackups || echo "Copy of $proddir/$oldfile to $proddir/eclipse-prod.bz2.weekly.0 failed"|tee -a /var/log/backups
+            continue
+        fi
+    fi
+    echo "$(date '+%b %e %T') $(hostname -s) $(basename $0)[$$] removing old file: $oldfile" >>/var/log/backups
+    /bin/rm -f $oldfile
+done
+rotatebackups
